@@ -1,8 +1,15 @@
 // HMJ
 import * as THREE from 'three';
-import React, { forwardRef, useEffect, useRef } from 'react';
+import React, {
+  forwardRef,
+  useEffect,
+  useRef,
+  useMemo,
+  useImperativeHandle,
+  // useState,
+} from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
-import { useAnimations, useGLTF } from '@react-three/drei';
+import { useAnimations, useFBO, useGLTF } from '@react-three/drei';
 
 /**
  * ## Rendering Pipeline: webgl + three.js ###
@@ -68,7 +75,58 @@ const uniformsGlsl = /*glsl*/ `
 	//We can create them from within the shader, but easier to just feed it in. 
 	uniform sampler2D tAudioData;
 	uniform float sampleRate; 
+
+	/**
+	 * Bit of physics: sound is made up of the superposition of waves. The basis vectors of these waves (i.e. the  basic building blocks) 
+	 * are sinθ and cosθ waves of different frequencies with different amplitudes. 
+	 * We can do the fourier transform on these waves to determine what what are the specific frequencies of waves which make up the sound, and
+	 * in what proprtion. Music is transient (i.e it changes from momeent to moment), so we need to keep resampling, and doing the fourier transform.
+	 * On computers, we can approximate fourier transform using the fast fourier transform, which requires a given interval of time, dt.  
+	 * 
+	 * By doing the FFT, we get, for each time period dt, a historgram of values, where each bin represents a particular frequency band of the waves. We 
+	 * generally visualise this via spectograms. In our case, we will get another historgram of frequency band values for every time period. We can visalise 
+	 * this using a spectogram.
+	 * 
+	 * In order to 'save to memory' this historical frequency band data, we render the latest information into a row of a texture. On the next interval
+	 * we increment the row by one, and render the next row of data in. [note: RTT - rener to texture].
+	 */
 `;
+
+type SpectogramBufferProps = { size?: number };
+
+//eslint-disable-next-line
+const SpectogramTexture = forwardRef<THREE.Texture, SpectogramBufferProps>(({ size }, ref) => {
+  const dpr = useThree((state) => state.viewport.dpr);
+  const { width, height } = useThree((state) => state.size);
+  const w = size || width * dpr;
+  const h = size || height * dpr;
+
+  const fboSettings: THREE.WebGLRenderTargetOptions = useMemo(() => {
+    return {};
+  }, [w, h]);
+
+  const spectogramFBO = useFBO(w, h, fboSettings);
+
+  useImperativeHandle(ref, () => spectogramFBO.texture);
+
+  return useFrame((state) => {
+    state.gl.setRenderTarget(spectogramFBO);
+    state.gl.render(state.scene, state.camera);
+    state.gl.setRenderTarget(null);
+  });
+});
+
+// use:
+// const Foo: FC<{}> = () => {
+//   const [spectogramTexture, setSpectogramTexture] = useState<THREE.Texture>(null!);
+
+//   return (
+//     <>
+//       <SpectogramTexture ref={setSpectogramTexture} size={256} />
+//       <SomethingThatNeedsTheSpectogramTexture spectogramBuffer={spectogramTexture} />
+//     </>
+//   );
+// };
 
 // We can represent the audio data in different ways:
 //eslint-disable-next-line
@@ -126,12 +184,15 @@ const Analyzer = forwardRef<THREE.Audio<AudioNode>, AnalyzerPropsType>(
          * Each item in the array represents the decibel value for a specific frequency.
          * The frequencies are spread linearly from 0 to 1/2 of the sample rate.
          * For example, for 48000 sample rate, the last item of the array will represent the decibel value for 24000 Hz
+         * see: https://stackoverflow.com/questions/14789283/what-does-the-fft-data-in-the-web-audio-api-correspond-to/14789992#14789992
          */
         const frequencyData: Uint8Array = analyser.current.getFrequencyData();
         //eslint-disable-next-line
         const frequencyDataBufferLenght = analyser.current.analyser.frequencyBinCount;
         //eslint-disable-next-line
         const sampleRate: number = analyser.current.analyser.context.sampleRate;
+        //eslint-disable-next-line
+        const nyquistFrequency: number = 0.5 * sampleRate;
 
         const averageFrequencyData: number = analyser.current.getAverageFrequency();
 
