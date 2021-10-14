@@ -1,10 +1,14 @@
 // HMJ
 import * as THREE from 'three';
 import React, { forwardRef, useEffect, useRef } from 'react';
-import { useFrame } from '@react-three/fiber';
+import { useFrame, useThree } from '@react-three/fiber';
 import { useAnimations, useGLTF } from '@react-three/drei';
 
 /**
+ * ## Rendering Pipeline: webgl + three.js ###
+ *
+ * (note: I've added in the gltf version of the glb file in the /public directory, in order that you can
+ * more easily see the different buffers contained within the model)
  *
  * GLB model includees a set of meshes. Meshes are made up of triangular faces, which in turn are made up of
  * vertices and edges. Often meshes are represented as buffers of vertices, edges, and indices (which index whhich
@@ -63,6 +67,7 @@ const uniformsGlsl = /*glsl*/ `
 	//Samplers encapsulate the various render states associated with reading textures: coordinate system, addressing mode, and filtering
 	//We can create them from within the shader, but easier to just feed it in. 
 	uniform sampler2D tAudioData;
+	uniform float sampleRate; 
 `;
 
 // We can represent the audio data in different ways:
@@ -81,7 +86,12 @@ const Analyzer = forwardRef<THREE.Audio<AudioNode>, AnalyzerPropsType>(
   ({ hasRainbowColor, isLinear }, forwardedRef) => {
     const sound = forwardedRef as React.RefObject<THREE.Audio<AudioNode>>;
     const mesh = useRef<THREE.Mesh>(null!);
+    const shaderMaterialRef = useRef<THREE.ShaderMaterial>(null!);
+
     const analyser = useRef<THREE.AudioAnalyser>(null!);
+    const { gl } = useThree();
+    const FFT_SIZE = 128; // A non-zero power of two up to 2048, representing the size of the FFT (Fast Fourier Transform) to be used to determine the frequency domain.
+    const format = gl.capabilities.isWebGL2 ? THREE.RedFormat : THREE.LuminanceFormat;
 
     const group = useRef();
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -101,21 +111,49 @@ const Analyzer = forwardRef<THREE.Audio<AudioNode>, AnalyzerPropsType>(
 
     useEffect(() => {
       if (sound.current) {
-        analyser.current = new THREE.AudioAnalyser(sound.current, 32);
+        analyser.current = new THREE.AudioAnalyser(sound.current, FFT_SIZE);
       }
     }, []);
-    useFrame(() => {
+    useFrame(({ mouse }) => {
       if (analyser.current) {
-        const data = analyser.current.getAverageFrequency();
+        /**
+         * analyser.getFrequencyData() uses the Web Audio's
+         * getByteFrequencyData method.
+         * Returns array of half size of fftSize.
+         * ex. if fftSize = 2048, array size will be 1024.
+         * data includes magnitude of low ~ high frequency.
+         * The frequency data is composed of integers on a scale from 0 to 255.
+         * Each item in the array represents the decibel value for a specific frequency.
+         * The frequencies are spread linearly from 0 to 1/2 of the sample rate.
+         * For example, for 48000 sample rate, the last item of the array will represent the decibel value for 24000 Hz
+         */
+        const frequencyData: Uint8Array = analyser.current.getFrequencyData();
+        //eslint-disable-next-line
+        const frequencyDataBufferLenght = analyser.current.analyser.frequencyBinCount;
+        //eslint-disable-next-line
+        const sampleRate: number = analyser.current.analyser.context.sampleRate;
 
-        if (mesh.current && Object.keys(actions).length > 0 && data >= 50) {
-          const displacementValue = data / 200;
+        const averageFrequencyData: number = analyser.current.getAverageFrequency();
+
+        if (mesh.current && Object.keys(actions).length > 0 && averageFrequencyData >= 50) {
+          const displacementValue = averageFrequencyData / 200;
 
           if (mesh.current.morphTargetDictionary) {
             mesh.current.morphTargetDictionary.Displace = displacementValue;
           }
           mesh.current.morphTargetInfluences = [displacementValue];
         }
+
+        // update our uniforms imperatively
+        shaderMaterialRef.current.uniforms.mouse.value = mouse;
+        shaderMaterialRef.current.uniforms.mouse.value.needsUpdate = true;
+        shaderMaterialRef.current.uniforms.tAudioData.value = new THREE.DataTexture(
+          frequencyData,
+          FFT_SIZE / 2,
+          1,
+          format,
+        );
+        shaderMaterialRef.current.uniforms.tAudioData.value.needsUpdate = true;
       }
     });
 
