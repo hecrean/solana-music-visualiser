@@ -15,6 +15,7 @@
     "@types/node": "^12.20.27",
     "@types/react": "^17.0.24",
     "@types/react-dom": "^17.0.9",
+    "babel-plugin-glsl": "^1.0.0",
     "eslint": "^7.32.0",
     "react": "^17.0.2",
     "react-dom": "^17.0.2",

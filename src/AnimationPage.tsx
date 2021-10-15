@@ -1,7 +1,7 @@
 // HMJ
 
 import React, { Suspense, useState } from 'react';
-import { OrbitControls } from '@react-three/drei';
+import { OrbitControls, OrthographicCamera } from '@react-three/drei';
 import { Canvas } from '@react-three/fiber';
 
 import PlaySound from './animation/PlaySound';
@@ -81,11 +81,12 @@ const AnimationPage = ({
       <p className="py-12">{audioFileName}</p>
       <div className="w-full h-64 md:h-98">
         <Suspense fallback="Loading">
-          <Canvas camera={{ position: [0, 0, 2.5], far: 50 }}>
+          <Canvas>
             {audioFile != null && (
               <>
                 <PlaySound hasRainbowColor={hasColor} isLinear={isLinear} url={audioFile} />
-                <OrbitControls enableZoom={false} />
+                <OrbitControls enableZoom />
+                <OrthographicCamera bottom={-1} far={1} left={-1} near={0} right={1} top={1} />
                 <ambientLight />
                 <pointLight position={[10, 10, 10]} />
               </>

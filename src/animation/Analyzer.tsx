@@ -6,11 +6,13 @@ import React, {
   useRef,
   useMemo,
   useImperativeHandle,
-  // useState,
+  useState,
 } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
-import { useAnimations, useFBO, useGLTF } from '@react-three/drei';
+import { /*useAnimations,*/ useFBO, useGLTF } from '@react-three/drei';
+import glsl from 'babel-plugin-glsl/macro';
 
+import { colorLookupTable, Pow2 } from './colour-lookup-table';
 /**
  * ## Rendering Pipeline: webgl + three.js ###
  *
@@ -61,21 +63,15 @@ import { useAnimations, useFBO, useGLTF } from '@react-three/drei';
  */
 
 //eslint-disable-next-line
-const uniformsGlsl = /*glsl*/ `
-	//This uniform is fed into the GPU via a buffer
-	struct Mouse {
-		vec2 position;
-		bool left_button_state; //true for down; false for up
-		bool right_button_state; // ^ as above
-		bool middle_button_state; // ^ as above
-	}
-	uniform Mouse mouse;
+const vertexShader = glsl`
+  // #define FFT_SIZE
 
+	//This uniform is fed into the GPU via a buffer
+	uniform vec2 mouse;
 	//Samplers encapsulate the various render states associated with reading textures: coordinate system, addressing mode, and filtering
 	//We can create them from within the shader, but easier to just feed it in. 
 	uniform sampler2D tAudioData;
 	uniform float sampleRate; 
-
 	/**
 	 * Bit of physics: sound is made up of the superposition of waves. The basis vectors of these waves (i.e. the  basic building blocks) 
 	 * are sinθ and cosθ waves of different frequencies with different amplitudes. 
@@ -90,12 +86,72 @@ const uniformsGlsl = /*glsl*/ `
 	 * In order to 'save to memory' this historical frequency band data, we render the latest information into a row of a texture. On the next interval
 	 * we increment the row by one, and render the next row of data in. [note: RTT - rener to texture].
 	 */
+	uniform sampler2D tSpectogram;
+	uniform vec3 colorLookupTable[HALF_FFT_SIZE];
+
+	varying vec3 vPosition; 
+	varying vec2 vUv; 
+	varying vec3 vNormal; 
+
+
+
+	 void main()
+	 {
+		 // pass vertex attributes to frag shader via varyings:
+			vPosition = position; 
+			vUv = uv; 
+			vNormal = normal; 
+
+
+			// note: this is a 1-d array. There is a wrapping on the texture, which means when we read from coordinates outside
+			// the domain, it wraps back on itself
+
+
+			
+
+	 
+	 
+			vec4 modelPosition = modelMatrix * vec4( vec3(position.x, position.y, position.z), 1.0);
+			vec4 viewPosition = viewMatrix * modelPosition;
+			vec4 projectionPosition = projectionMatrix * viewPosition;
+			gl_Position = projectionPosition;
+	}
 `;
 
-type SpectogramBufferProps = { size?: number };
+const fragmentShader = glsl`
+// #pragma glslify: blend = require("../../shaders/functions/glsl-blend/add.glsl")
+uniform vec2 mouse;
+uniform sampler2D tAudioData;
+uniform float sampleRate; 
+uniform sampler2D tSpectogram;
+uniform vec3 colorLookupTable[HALF_FFT_SIZE]; 
+
+
+varying vec3 vPosition; 
+varying vec2 vUv; 
+varying vec3 vNormal; 
+
+
+
+void main()
+{
+	// vec4 fourier_transform = fft(tAudioData, resolution, subtransformSize, horizontal, forward, normalization);
+
+	// I think all the data is packed into the .r channel, but whatever... 
+	vec4 sound = texture2D( tAudioData, vec2( vUv.x, vUv.y ) ); // <- I'm really not sure in which format this data comes out... Does interpolation occut?
+			// int soundIndex = int(sound.r) * int(255); // <- I think sound is all between 0-1
+			// vColor = colorLookupTable[soundIndex]; 
+	vec3 color = vec3(sound.r, 0., 0.);
+	
+	
+  gl_FragColor = vec4(color, 1.);
+}
+`;
+
+type SpectogramTextureProps = { size?: number };
 
 //eslint-disable-next-line
-const SpectogramTexture = forwardRef<THREE.Texture, SpectogramBufferProps>(({ size }, ref) => {
+const SpectogramTexture = forwardRef<unknown, SpectogramTextureProps>(({ size }, ref) => {
   const dpr = useThree((state) => state.viewport.dpr);
   const { width, height } = useThree((state) => state.size);
   const w = size || width * dpr;
@@ -116,139 +172,161 @@ const SpectogramTexture = forwardRef<THREE.Texture, SpectogramBufferProps>(({ si
   });
 });
 
-// use:
-// const Foo: FC<{}> = () => {
-//   const [spectogramTexture, setSpectogramTexture] = useState<THREE.Texture>(null!);
-
-//   return (
-//     <>
-//       <SpectogramTexture ref={setSpectogramTexture} size={256} />
-//       <SomethingThatNeedsTheSpectogramTexture spectogramBuffer={spectogramTexture} />
-//     </>
-//   );
-// };
-
 // We can represent the audio data in different ways:
 //eslint-disable-next-line
 type RepresentationADT = { kind: 'morph-target-displacement' } | { kind: 'spectogram' };
 
 const GROUP_SCALE = 2.23;
-const DEFAULT_MESH_SCALE = 0.25;
+// const DEFAULT_MESH_SCALE = 0.25;
 
 type AnalyzerPropsType = {
   isLinear: boolean;
   hasRainbowColor: boolean;
 };
 
-const Analyzer = forwardRef<THREE.Audio<AudioNode>, AnalyzerPropsType>(
-  ({ hasRainbowColor, isLinear }, forwardedRef) => {
-    const sound = forwardedRef as React.RefObject<THREE.Audio<AudioNode>>;
-    const mesh = useRef<THREE.Mesh>(null!);
-    const shaderMaterialRef = useRef<THREE.ShaderMaterial>(null!);
+const Analyzer = forwardRef<THREE.Audio<AudioNode>, AnalyzerPropsType>((props, forwardedRef) => {
+  const { gl, mouse } = useThree();
 
-    const analyser = useRef<THREE.AudioAnalyser>(null!);
-    const { gl } = useThree();
-    const FFT_SIZE = 128; // A non-zero power of two up to 2048, representing the size of the FFT (Fast Fourier Transform) to be used to determine the frequency domain.
-    const format = gl.capabilities.isWebGL2 ? THREE.RedFormat : THREE.LuminanceFormat;
+  // eslint-disable-next-line
+  const [spectogramTexture, setSpectogramTexture] = useState<THREE.Texture>(null!);
 
-    const group = useRef();
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    const { nodes, materials, animations } = useGLTF('/cubetesting_metalic.glb');
-    const { actions } = useAnimations(animations, group);
-    useEffect(() => {
-      if (mesh.current != null) {
-        const morphs = mesh.current.morphTargetDictionary;
+  const sound = forwardedRef as React.RefObject<THREE.Audio<AudioNode>>;
+  const mesh = useRef<THREE.Mesh>(null!);
+  const shaderMaterialRef = useRef<THREE.ShaderMaterial>(null!);
 
-        if (morphs != null) {
-          morphs.Displace = 0.3;
-          mesh.current.morphTargetInfluences = [0.12];
-        }
+  const analyser = useRef<THREE.AudioAnalyser>(null!);
+  const FFT_SIZE: Pow2 = 512; // A non-zero power of two up to 2048, representing the size of the FFT (Fast Fourier Transform) to be used to determine the frequency domain.
+  const HALF_FFT_SIZE: Pow2 = 256;
+  const format = gl.capabilities.isWebGL2 ? THREE.RedFormat : THREE.LuminanceFormat;
+
+  const group = useRef();
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore
+  // const { nodes, animations } = useGLTF('/cubetesting_metalic.glb');
+  // const { actions } = useAnimations(animations, group);
+  useEffect(() => {
+    if (mesh.current != null) {
+      const morphs = mesh.current.morphTargetDictionary;
+
+      if (morphs != null) {
+        morphs.Displace = 0.3;
+        mesh.current.morphTargetInfluences = [0.12];
       }
-    });
+    }
+  });
 
-    useEffect(() => {
-      if (sound.current) {
-        analyser.current = new THREE.AudioAnalyser(sound.current, FFT_SIZE);
-      }
-    }, []);
-    useFrame(({ mouse }) => {
-      if (analyser.current) {
-        /**
-         * analyser.getFrequencyData() uses the Web Audio's
-         * getByteFrequencyData method.
-         * Returns array of half size of fftSize.
-         * ex. if fftSize = 2048, array size will be 1024.
-         * data includes magnitude of low ~ high frequency.
-         * The frequency data is composed of integers on a scale from 0 to 255.
-         * Each item in the array represents the decibel value for a specific frequency.
-         * The frequencies are spread linearly from 0 to 1/2 of the sample rate.
-         * For example, for 48000 sample rate, the last item of the array will represent the decibel value for 24000 Hz
-         * see: https://stackoverflow.com/questions/14789283/what-does-the-fft-data-in-the-web-audio-api-correspond-to/14789992#14789992
-         */
-        const frequencyData: Uint8Array = analyser.current.getFrequencyData();
-        //eslint-disable-next-line
-        const frequencyDataBufferLenght = analyser.current.analyser.frequencyBinCount;
-        //eslint-disable-next-line
-        const sampleRate: number = analyser.current.analyser.context.sampleRate;
-        //eslint-disable-next-line
-        const nyquistFrequency: number = 0.5 * sampleRate;
+  useEffect(() => {
+    if (sound.current) {
+      analyser.current = new THREE.AudioAnalyser(sound.current, FFT_SIZE);
+    }
+  }, []);
 
-        const averageFrequencyData: number = analyser.current.getAverageFrequency();
+  const colorLookupVec3Array = useMemo(() => {
+    return colorLookupTable[HALF_FFT_SIZE].map(
+      (colorTriplet) => new THREE.Vector3(colorTriplet[0], colorTriplet[1], colorTriplet[2]),
+    );
+  }, []);
 
-        if (mesh.current && Object.keys(actions).length > 0 && averageFrequencyData >= 50) {
-          const displacementValue = averageFrequencyData / 200;
+  const initialUniforms = useMemo(() => {
+    return {
+      mouse: { value: mouse },
+      tAudioData: { value: THREE.Texture.DEFAULT_IMAGE },
+      tSpectogram: { value: THREE.Texture.DEFAULT_IMAGE },
+      sampleRate: { value: 0 },
+      colorLookupTable: { value: colorLookupVec3Array, type: '' },
+    };
+  }, []);
 
-          if (mesh.current.morphTargetDictionary) {
-            mesh.current.morphTargetDictionary.Displace = displacementValue;
-          }
-          mesh.current.morphTargetInfluences = [displacementValue];
-        }
+  useFrame(({ mouse }) => {
+    /**
+     * analyser.getFrequencyData() uses the Web Audio's
+     * getByteFrequencyData method.
+     * Returns array of half size of fftSize.
+     * ex. if fftSize = 2048, array size will be 1024.
+     * data includes magnitude of low ~ high frequency.
+     * The frequency data is composed of integers on a scale from 0 to 255.
+     * Each item in the array represents the decibel value for a specific frequency.
+     * The frequencies are spread linearly from 0 to 1/2 of the sample rate.
+     * For example, for 48000 sample rate, the last item of the array will represent the decibel value for 24000 Hz
+     * see: https://stackoverflow.com/questions/14789283/what-does-the-fft-data-in-the-web-audio-api-correspond-to/14789992#14789992
+     */
+    const frequencyData: Uint8Array = analyser.current.getFrequencyData();
+    //eslint-disable-next-line
+    const frequencyDataBufferLenght = analyser.current.analyser.frequencyBinCount;
+    //eslint-disable-next-line
+    const sampleRate: number = analyser.current.analyser.context.sampleRate;
+    //eslint-disable-next-line
+    const nyquistFrequency: number = 0.5 * sampleRate;
 
-        // update our uniforms imperatively
-        shaderMaterialRef.current.uniforms.mouse.value = mouse;
-        shaderMaterialRef.current.uniforms.mouse.value.needsUpdate = true;
-        shaderMaterialRef.current.uniforms.tAudioData.value = new THREE.DataTexture(
-          frequencyData,
-          FFT_SIZE / 2,
-          1,
-          format,
-        );
-        shaderMaterialRef.current.uniforms.tAudioData.value.needsUpdate = true;
-      }
-    });
+    // const averageFrequencyData: number = analyser.current.getAverageFrequency();
 
-    useFrame((_state, delta) => {
-      if (mesh.current && mesh.current.rotation) {
-        mesh.current.rotation.x -= (0.01 * Math.PI) / 180;
-        mesh.current.rotation.y += delta * 0.15;
-      }
-    });
+    // if (mesh.current && Object.keys(actions).length > 0 && averageFrequencyData >= 50) {
+    //   const displacementValue = averageFrequencyData / 200;
 
-    return (
+    //   if (mesh.current.morphTargetDictionary) {
+    //     mesh.current.morphTargetDictionary.Displace = displacementValue;
+    //   }
+    //   mesh.current.morphTargetInfluences = [displacementValue];
+    // }
+
+    // update our uniforms imperatively
+    shaderMaterialRef.current.uniforms.mouse.value = mouse;
+    shaderMaterialRef.current.uniforms.mouse.value.needsUpdate = true;
+    shaderMaterialRef.current.uniforms.tAudioData.value = new THREE.DataTexture(
+      frequencyData,
+      FFT_SIZE / 2,
+      1,
+      format,
+    );
+    shaderMaterialRef.current.uniforms.tAudioData.value.needsUpdate = true;
+    shaderMaterialRef.current.uniforms.sampleRate.value = sampleRate;
+    // shaderMaterialRef.current.uniforms.sampleRate.value.needsUpdate = true;
+    shaderMaterialRef.current.uniforms.tSpectogram.value = spectogramTexture;
+    shaderMaterialRef.current.uniforms.tSpectogram.value.needsUpdate = true;
+
+    shaderMaterialRef.current.uniforms.colorLookupTable.value = colorLookupVec3Array;
+  });
+
+  // useFrame((_state, delta) => {
+  //   if (mesh.current && mesh.current.rotation) {
+  //     mesh.current.rotation.x -= (0.01 * Math.PI) / 180;
+  //     mesh.current.rotation.y += delta * 0.15;
+  //   }
+  // });
+
+  return (
+    <>
+      <SpectogramTexture ref={setSpectogramTexture} size={FFT_SIZE / 2} />
       <group ref={group} dispose={null}>
-        <group name="Armature" position={[0, -1, 0]} scale={GROUP_SCALE}>
-          <mesh
-            ref={mesh}
-            geometry={nodes.Globe_1.geometry}
-            material={materials['spherematerial.001']}
-            morphTargetDictionary={nodes.Globe_1.morphTargetDictionary}
-            morphTargetInfluences={nodes.Globe_1.morphTargetInfluences}
-            name="Globe_1"
-            position={[0, 0.49, 0]}
-            scale={DEFAULT_MESH_SCALE + 0.02}
-          >
-            {hasRainbowColor ? (
-              <meshNormalMaterial wireframe={isLinear} />
+        <group name="Armature" position={[0, 0, 0]} scale={GROUP_SCALE}>
+          <mesh ref={mesh}>
+            <planeBufferGeometry args={[2, 2]} />
+            {analyser.current ? (
+              <shaderMaterial
+                ref={shaderMaterialRef}
+                alphaTest={0}
+                attach="material"
+                defines={{
+                  HALF_FFT_SIZE,
+                }}
+                fragmentShader={fragmentShader}
+                side={THREE.DoubleSide}
+                uniforms={initialUniforms}
+                vertexShader={vertexShader}
+                depthWrite
+                vertexColors
+                // needsUpdate={true}
+                // uniformsNeedUpdate={true}
+              />
             ) : (
-              <meshPhongMaterial color="#505050" shininess={10} wireframe={isLinear} />
+              <meshBasicMaterial />
             )}
           </mesh>
         </group>
       </group>
-    );
-  },
-);
+    </>
+  );
+});
 
 useGLTF.preload('/cubetesting_metalic.glb');
 
