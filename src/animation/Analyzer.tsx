@@ -139,8 +139,8 @@ void main()
 
 	// I think all the data is packed into the .r channel, but whatever... 
 	vec4 sound = texture2D( tAudioData, vec2( vUv.x, vUv.y ) ); // <- I'm really not sure in which format this data comes out... Does interpolation occut?
-			// int soundIndex = int(sound.r) * int(255); // <- I think sound is all between 0-1
-			// vColor = colorLookupTable[soundIndex]; 
+	// int soundIndex = int(sound.r) * int(255); // <- I think sound is all between 0-1
+	// vColor = colorLookupTable[soundIndex]; 
 	vec3 color = vec3(sound.r, 0., 0.);
 	
 	
